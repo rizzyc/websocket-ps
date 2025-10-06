@@ -1,86 +1,53 @@
-// server.js
+// server.js - For Render.com deployment (Socket.IO version)
+
 const express = require('express');
-const { WebSocketServer } = require('ws');
 const http = require('http');
+const { Server } = require('socket.io'); // Correct import for Socket.IO
 
 const app = express();
-const PORT = process.env.PORT || 3001;
-
-// Create HTTP server
 const server = http.createServer(app);
 
-// Create WebSocket server
-const wss = new WebSocketServer({ server });
+// IMPORTANT: Configure Socket.IO with CORS
+const io = new Server(server, {
+    cors: {
+        origin: [
+            "http://localhost:3000", // For your local Next.js development
+            "https://your-netlify-app-url.netlify.app", // **Replace with your actual Netlify URL after deployment! DO NOT HAVE THIS SET UP YET**
+        ],
+        methods: ["GET", "POST"],
+        credentials: true
+    }
+});
 
-// Store connected clients
-const clients = new Set();
+let clickCount = 0; // Initialize a shared click counter
+
+io.on('connection', (socket) => {
+    console.log('A user connected');
+
+    // Send the current count to the newly connected client
+    socket.emit('countUpdate', clickCount);
+
+    socket.on('incrementClick', () => {
+        clickCount++;
+        // Broadcast the updated count to all connected clients
+        io.emit('countUpdate', clickCount);
+        console.log(`Click count updated to: ${clickCount}`);
+    });
+
+    socket.on('disconnect', () => {
+        console.log('User disconnected');
+    });
+});
 
 // Basic HTTP endpoint for health checks
 app.get('/', (req, res) => {
-    res.json({
-        status: 'WebSocket server running',
-        connections: clients.size
-    });
+    res.send('Socket.IO server is running!');
 });
 
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok' });
-});
+// Render.com will set process.env.PORT, otherwise use 3001 as a fallback for local dev
+const PORT = process.env.PORT || 3001;
 
-// WebSocket connection handler
-wss.on('connection', (ws) => {
-    console.log('New client connected');
-    clients.add(ws);
-
-    // Send welcome message
-    ws.send(JSON.stringify({
-        type: 'welcome',
-        message: 'Connected to WebSocket server',
-        timestamp: new Date().toISOString()
-    }));
-
-    // Handle incoming messages
-    ws.on('message', (data) => {
-        try {
-            const message = JSON.parse(data);
-            console.log('Received:', message);
-
-            // Echo back to sender
-            ws.send(JSON.stringify({
-                type: 'echo',
-                original: message,
-                timestamp: new Date().toISOString()
-            }));
-
-            // Broadcast to all other clients
-            clients.forEach((client) => {
-                if (client !== ws && client.readyState === 1) { // 1 = OPEN
-                    client.send(JSON.stringify({
-                        type: 'broadcast',
-                        data: message,
-                        timestamp: new Date().toISOString()
-                    }));
-                }
-            });
-        } catch (err) {
-            console.error('Error parsing message:', err);
-        }
-    });
-
-    // Handle client disconnect
-    ws.on('close', () => {
-        console.log('Client disconnected');
-        clients.delete(ws);
-    });
-
-    // Handle errors
-    ws.on('error', (error) => {
-        console.error('WebSocket error:', error);
-    });
-});
-
-// Start server
 server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
+    console.log(`Socket.IO Server running on port ${PORT}`);
+    console.log(`Socket.IO endpoint: https://websocket-ps.onrender.com/ (for clients)`);
 });
