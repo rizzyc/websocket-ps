@@ -37,6 +37,13 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => {
         console.log('User disconnected');
     });
+
+    socket.on('resetCounter', () => {
+        clickCount = 0;
+        io.emit('countUpdate', clickCount);
+        console.log('Counter reset to 0');
+    });
+
 });
 
 // Basic HTTP endpoint for health checks
