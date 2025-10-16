@@ -1,16 +1,15 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const { v4: uuidv4 } = require('uuid'); // To generate unique room IDs
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const server = http.createServer(app);
 
-// IMPORTANT: Configure Socket.IO with CORS
 const io = new Server(server, {
     cors: {
         origin: [
-            "http://localhost:3000", // For your local Next.js development
+            "http://localhost:3000",
             "https://your-netlify-app-url.netlify.app", // **Replace with your actual Netlify URL!**
         ],
         methods: ["GET", "POST"],
@@ -19,7 +18,29 @@ const io = new Server(server, {
 });
 
 // --- In-memory storage for active rooms and their users ---
-const activeRooms = {}; // { "roomId": { users: [{ id: "socketId", name: "UserA" }] } }
+// Added a 'timeout' property to rooms
+const activeRooms = {}; // { "roomId": { users: [{ id: "socketId", name: "UserA" }], timeout: null } }
+const ROOM_EMPTY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes (adjust as needed)
+
+// Helper to clear room timeout
+function clearTimeoutForRoom(roomId) {
+    if (activeRooms[roomId] && activeRooms[roomId].timeout) {
+        clearTimeout(activeRooms[roomId].timeout);
+        activeRooms[roomId].timeout = null;
+    }
+}
+
+// Helper to start room deletion timeout
+function startTimeoutForRoom(roomId) {
+    clearTimeoutForRoom(roomId); // Ensure no old timeout is running
+    activeRooms[roomId].timeout = setTimeout(() => {
+        if (activeRooms[roomId] && activeRooms[roomId].users.length === 0) {
+            delete activeRooms[roomId];
+            console.log(`Room ${roomId} is now empty and has been deleted after timeout.`);
+        }
+    }, ROOM_EMPTY_TIMEOUT_MS);
+    console.log(`Room ${roomId} is empty. Deletion scheduled in ${ROOM_EMPTY_TIMEOUT_MS / 1000} seconds.`);
+}
 
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
@@ -28,16 +49,17 @@ io.on('connection', (socket) => {
     socket.on('createRoom', ({ userName }) => {
         const roomId = uuidv4();
         activeRooms[roomId] = {
-            users: [{ id: socket.id, name: userName }]
+            users: [{ id: socket.id, name: userName }],
+            timeout: null // New rooms start without a timeout
         };
 
         socket.join(roomId);
+        clearTimeoutForRoom(roomId); // If by some chance it had a timeout
 
-        // Emit event back to the creator with room details and their info
         socket.emit('roomCreated', {
             roomId,
             userName,
-            usersInRoom: activeRooms[roomId].users // Send current users
+            usersInRoom: activeRooms[roomId].users
         });
         console.log(`Room created: ${roomId} by ${userName} (${socket.id})`);
     });
@@ -45,26 +67,37 @@ io.on('connection', (socket) => {
     // --- Event: joinRoom ---
     socket.on('joinRoom', ({ roomId, userName }) => {
         if (activeRooms[roomId]) {
-            // Add user to the room's user list
-            activeRooms[roomId].users.push({ id: socket.id, name: userName });
-            socket.join(roomId); // Make the socket join the room
+            // Found room, ensure it doesn't get deleted while active
+            clearTimeoutForRoom(roomId);
+
+            // Check if user (by socket.id) is already in this room's user list
+            const existingUser = activeRooms[roomId].users.find(user => user.id === socket.id);
+            if (existingUser) {
+                // User's socket is already registered, perhaps a redundant join or reconnect logic
+                console.log(`User ${userName} (${socket.id}) already registered in room ${roomId}. Re-confirming.`);
+            } else {
+                activeRooms[roomId].users.push({ id: socket.id, name: userName });
+            }
+
+            socket.join(roomId);
 
             const usersInRoom = activeRooms[roomId].users;
 
-            // Emit event back to the joining user with room details
-            socket.emit('roomJoined', { // This event is for the joining user ONLY
+            socket.emit('roomJoined', {
                 roomId,
-                userName, // The name of the user who just joined
-                usersInRoom // All users currently in the room
+                userName,
+                usersInRoom
             });
 
-            // Broadcast to all *other* users in that room that a new user joined
-            // This sends to all sockets in roomId EXCEPT the sender (socket.id)
-            socket.to(roomId).emit('userJoined', { // This event is for existing users in the room
-                userName, // The name of the user who just joined
-                usersInRoom // All users currently in the room
+            // Only broadcast 'userJoined' if it's a new user joining or a rejoining user whose presence should be announced
+            // For now, let's keep it simple and announce any socket.id that joins (even if it's the same person refreshing)
+            // You might refine this to only announce truly *new* users to avoid chat spam if user refreshes.
+            socket.to(roomId).emit('userJoined', {
+                userName,
+                usersInRoom
             });
             console.log(`User ${userName} (${socket.id}) joined room ${roomId}`);
+
         } else {
             socket.emit('roomError', { message: 'Room not found.' });
             console.log(`Attempt to join non-existent room: ${roomId} by ${userName}`);
@@ -74,7 +107,6 @@ io.on('connection', (socket) => {
     // --- Event: disconnect ---
     socket.on('disconnect', () => {
         console.log(`User disconnected: ${socket.id}`);
-        // Find which room the disconnected user was in and remove them
         for (const roomId in activeRooms) {
             const room = activeRooms[roomId];
             const initialUserCount = room.users.length;
@@ -85,25 +117,20 @@ io.on('connection', (socket) => {
             if (room.users.length < initialUserCount) { // User was found and removed
                 console.log(`User ${disconnectedUser ? disconnectedUser.name : 'Unknown'} (${socket.id}) removed from room ${roomId}`);
                 if (room.users.length === 0) {
-                    delete activeRooms[roomId]; // Delete room if no users left
-                    console.log(`Room ${roomId} is now empty and deleted.`);
+                    // Room is now empty, start a timeout for deletion
+                    startTimeoutForRoom(roomId);
                 } else {
-                    // Notify remaining users in the room
-                    // Use 'io.to(roomId)' to send to all sockets in the room (including sender, if sender wasn't disconnected)
-                    // or 'socket.to(roomId)' if you want to exclude a specific sender (but here sender is disconnected)
                     io.to(roomId).emit('userLeft', {
-                        // userId: socket.id, // For tracking who left
-                        userName: disconnectedUser ? disconnectedUser.name : 'A user', // Send name for better frontend message
+                        userName: disconnectedUser ? disconnectedUser.name : 'A user',
                         usersInRoom: room.users
                     });
                 }
-                break; // User found, no need to check other rooms
+                break;
             }
         }
     });
 });
 
-// Basic HTTP endpoint for health checks
 app.get('/', (req, res) => {
     res.json({
         status: 'Socket.IO server running',
